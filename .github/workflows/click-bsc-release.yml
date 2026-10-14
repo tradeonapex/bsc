@@ -78,6 +78,17 @@ jobs:
 
       - name: Build geth
         run: make geth
+        env:
+          # internal/build/env.go stamps the binary from GITHUB_SHA when it sees
+          # CI=true + GITHUB_ACTIONS=true. On a workflow_dispatch GITHUB_SHA is
+          # the click HEAD, which is not an object in a checkout of the upstream
+          # tag, so `git show -s --format=%ct` fails and the build dies. Clearing
+          # CI sends it down the LocalEnv() path, which reads the detached HEAD we
+          # actually checked out -- the correct commit to stamp. GITHUB_* vars are
+          # reserved and cannot be overridden; CI is an ordinary one.
+          CI: ""
+          # Mirrors bnb-chain's own release workflow.
+          CGO_CFLAGS_ALLOW: "-O -D__BLST_PORTABLE__"
 
       - name: Package the binary
         id: pkg
