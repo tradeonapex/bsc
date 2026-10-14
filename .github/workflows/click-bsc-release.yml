@@ -1,0 +1,180 @@
+---
+# Builds the bsc geth binary from this fork and publishes it as a release asset,
+# so ansible-bsc installs a binary we built instead of bnb-chain's prebuilt
+# geth_linux. mainnet.zip rides along so one version drives both URLs in the
+# role. Branch model: CLICK.md.
+name: click · geth_linux → release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Tag, branch or SHA to build"
+        required: true
+        default: v1.7.8
+      suffix:
+        description: "Release-tag suffix appended to the upstream ref"
+        required: true
+        default: click1
+      publish:
+        description: "Publish the release (off = build only, artifact kept for 7 days)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: click-bsc-${{ inputs.upstream_ref }}-${{ inputs.suffix }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: geth_linux @ ${{ inputs.upstream_ref }}
+    runs-on: lat-fra2-runners
+    timeout-minutes: 60
+
+    env:
+      # Where the chain config comes from. bnb-chain ships config.toml +
+      # genesis.json as mainnet.zip on its own releases; we re-attach it to ours
+      # so bsc_release_tag alone decides both downloads in the role.
+      UPSTREAM_REPO: bnb-chain/bsc
+      RELEASE_TAG: ${{ inputs.upstream_ref }}-${{ inputs.suffix }}
+
+    steps:
+      - name: Refuse to overwrite an existing release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release ${RELEASE_TAG} already exists. Bump the suffix (click2, …) instead of replacing a binary that hosts may already run."
+            exit 1
+          fi
+
+      - name: Checkout ${{ inputs.upstream_ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.upstream_ref }}
+          fetch-depth: 1
+          fetch-tags: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build geth
+        run: make geth
+
+      - name: Package the binary
+        id: pkg
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 build/bin/geth dist/geth_linux
+
+          echo "--- version ---"
+          ./dist/geth_linux version
+
+          # The runner image is Ubuntu 22.04 (glibc 2.35) and the hosts are newer,
+          # so this binary is forward-compatible. Print the highest glibc symbol it
+          # needs, so the day that stops being true is visible here and not on the
+          # node at service start.
+          echo "--- dynamic linking ---"
+          ldd dist/geth_linux || true
+          MAXGLIBC=$(objdump -T dist/geth_linux 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1 || true)
+          echo "max glibc required: ${MAXGLIBC:-none (static)}"
+
+          cd dist
+          sha256sum geth_linux > geth_linux.sha256
+          SHA=$(cut -d' ' -f1 geth_linux.sha256)
+          {
+            echo "sha256=${SHA}"
+            echo "maxglibc=${MAXGLIBC:-static}"
+            echo "commit=$(git -C .. rev-parse HEAD)"
+            echo "goversion=$(go version | awk '{print $3}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the matching mainnet.zip from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ inputs.upstream_ref }}" \
+            --repo "$UPSTREAM_REPO" \
+            --pattern mainnet.zip \
+            --dir dist
+          unzip -l dist/mainnet.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: geth_linux-${{ inputs.upstream_ref }}
+          path: dist/
+          retention-days: 7
+
+      - name: Publish the release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/notes.md <<EOF
+          Built by \`.github/workflows/click-bsc-release.yml\` for ansible-bsc.
+
+          | | |
+          |---|---|
+          | upstream ref | \`${{ inputs.upstream_ref }}\` (${UPSTREAM_REPO}) |
+          | upstream commit | \`${{ steps.pkg.outputs.commit }}\` |
+          | go | \`${{ steps.pkg.outputs.goversion }}\` |
+          | geth_linux sha256 | \`${{ steps.pkg.outputs.sha256 }}\` |
+          | max glibc required | \`${{ steps.pkg.outputs.maxglibc }}\` |
+          | run | [\`${GITHUB_RUN_ID}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |
+
+          \`mainnet.zip\` is upstream's, re-attached unchanged so one variable drives
+          both downloads in the role.
+
+          \`\`\`yaml
+          # rke2/<cluster>/inventory/host_vars/bsc-01 (or ansible-bsc defaults)
+          bsc_version: ${{ inputs.upstream_ref }}
+          bsc_release_tag: ${RELEASE_TAG}
+          bsc_geth_sha256: "${{ steps.pkg.outputs.sha256 }}"
+          \`\`\`
+          EOF
+
+          # Target the click branch, never the upstream commit: a tag whose tree
+          # carries upstream's .github/workflows could fire bnb-chain's own
+          # release pipeline on this fork. The notes above record what was built.
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target click \
+            --title "$RELEASE_TAG" \
+            --notes-file /tmp/notes.md \
+            dist/geth_linux dist/geth_linux.sha256 dist/mainnet.zip
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### bsc geth"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| upstream ref | \`${{ inputs.upstream_ref }}\` |"
+            echo "| commit | \`${{ steps.pkg.outputs.commit }}\` |"
+            echo "| sha256 | \`${{ steps.pkg.outputs.sha256 }}\` |"
+            echo "| max glibc | \`${{ steps.pkg.outputs.maxglibc }}\` |"
+            echo "| published | \`${{ inputs.publish }}\` |"
+            echo
+            echo "Set in \`ansible-bsc/defaults/main.yml\`:"
+            echo
+            echo '```yaml'
+            echo "bsc_release_tag: ${RELEASE_TAG}"
+            echo "bsc_geth_sha256: \"${{ steps.pkg.outputs.sha256 }}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
