@@ -97,3 +97,22 @@ What keeps that shut:
 Do not add `pull_request`, `pull_request_target` or `issue_comment` triggers to
 a workflow in this repository. If PR validation is ever wanted here, it belongs
 on GitHub-hosted runners, which are free for a public repository.
+
+## Why this builds on a GitHub-hosted runner
+
+Our self-hosted ARC scale sets (`lat-fra2-runners` and friends) are registered at
+the organisation and carry no `runnerGroup`, so they sit in the **Default** runner
+group — and a runner group does not serve **public** repositories unless an org
+admin explicitly allows it. This fork is public, so a job targeting
+`lat-fra2-runners` queues forever: the listener stays healthy with idle runners
+and simply never receives the message (`assigned job: 0`, `lastMessageID` frozen).
+There is no error anywhere; it just never starts.
+
+`ubuntu-22.04` sidesteps that entirely. Public repositories get unlimited free
+standard GitHub-hosted minutes, and 2.35 is older than the glibc on the target
+host, which is the safe direction for a dynamically linked binary. `bsc-01` runs
+bnb-chain's own prebuilt `geth_linux` today, and upstream builds that on
+`ubuntu-latest`, so the host's glibc is at least that new.
+
+The `runner` input keeps `lat-fra2-runners` selectable for the day a runner group
+that allows public repositories exists.

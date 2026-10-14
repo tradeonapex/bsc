@@ -21,6 +21,15 @@ on:
         required: false
         default: true
         type: boolean
+      runner:
+        description: "Where to build. ubuntu-22.04 is free on a public repo and its glibc (2.35) is older than the target host's, which is the safe direction. The self-hosted sets need a runner group that allows public repositories -- see CLICK.md."
+        required: false
+        default: ubuntu-22.04
+        type: choice
+        options:
+          - ubuntu-22.04
+          - ubuntu-latest
+          - lat-fra2-runners
 
 permissions:
   contents: write
@@ -32,7 +41,7 @@ concurrency:
 jobs:
   build:
     name: geth_linux @ ${{ inputs.upstream_ref }}
-    runs-on: lat-fra2-runners
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 60
 
     env:
