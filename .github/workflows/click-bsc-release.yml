@@ -263,7 +263,7 @@ jobs:
           fi
           {
             echo "list<<EOF"
-            git log --no-walk --format='- `%h` %s' $COMMITS
+            git log --no-walk --format='- %h %s' $COMMITS
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
