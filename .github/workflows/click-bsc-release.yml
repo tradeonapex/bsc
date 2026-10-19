@@ -177,6 +177,9 @@ jobs:
       # so bsc_release_tag alone decides both downloads in the role.
       UPSTREAM_REPO: bnb-chain/bsc
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      # The branch in this fork that holds Click's code. Point it at a new
+      # click-vX.Y.Z branch when the patches are ported to a new upstream release.
+      PATCH_BRANCH: click-v1.7.8
 
     steps:
       - name: Refuse to overwrite an existing release
@@ -191,9 +194,9 @@ jobs:
           fi
 
       # Checked out from bnb-chain, not from this fork, and that is the change
-      # that turns the button into a pipeline. `click` is upstream's tree with
-      # upstream's workflows removed and ours added -- it carries no code of
-      # ours -- but it only holds the tags that existed when the fork was made.
+      # that turns the button into a pipeline. Our own code is applied on top in
+      # the next steps, from PATCH_BRANCH. `click` only holds the tags that
+      # existed when the fork was made.
       # Building v1.8.1 from here would first require pushing that tag into this
       # repository, and a tag push whose tree carries upstream's 12 workflow
       # files is exactly what CLICK.md's branch model exists to avoid. Reading
@@ -225,6 +228,44 @@ jobs:
             echo "::error::${{ needs.resolve.outputs.upstream_ref }} moved between resolve and build. Refusing to build it."
             exit 1
           fi
+
+      # Our code lives on PATCH_BRANCH, a click-vX.Y.Z branch cut from upstream's
+      # vX.Y.Z. Its commits since that tag are cherry-picked onto the tag being
+      # built: merge commits and the commit that only removes upstream's
+      # workflows are skipped. A conflict stops the run; it means the patches
+      # need porting to the new upstream release on a new click-v branch.
+      - name: Apply Click's patches from ${{ env.PATCH_BRANCH }}
+        id: patches
+        run: |
+          set -euo pipefail
+          BASE_TAG="${PATCH_BRANCH#click-}"
+          git config user.name "click-bsc-release"
+          git config user.email "click-bsc-release@users.noreply.github.com"
+          git fetch --no-tags --depth=50 "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/heads/${PATCH_BRANCH}:refs/patches/head"
+          BASE_SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/tags/${BASE_TAG}^{}" | cut -f1)
+          [ -n "$BASE_SHA" ] || BASE_SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/tags/${BASE_TAG}" | cut -f1)
+          if [ -z "$BASE_SHA" ] || ! git merge-base --is-ancestor "$BASE_SHA" refs/patches/head; then
+            echo "::error::${PATCH_BRANCH} does not descend from upstream ${BASE_TAG}."
+            exit 1
+          fi
+          COMMITS=$(git rev-list --reverse --no-merges "${BASE_SHA}..refs/patches/head" -- . ':(exclude).github')
+          if [ -z "$COMMITS" ]; then
+            echo "::error::${PATCH_BRANCH} has no commits to apply since ${BASE_TAG}."
+            exit 1
+          fi
+          echo "Applying onto ${{ needs.resolve.outputs.upstream_ref }}:"
+          git log --no-walk --format='  %h %s' $COMMITS
+          if ! git cherry-pick $COMMITS; then
+            git cherry-pick --abort || true
+            echo "::error::Click's patches from ${PATCH_BRANCH} do not apply to ${{ needs.resolve.outputs.upstream_ref }}. Port them to a click-<that release> branch and point PATCH_BRANCH at it."
+            exit 1
+          fi
+          {
+            echo "list<<EOF"
+            git log --no-walk --format='- `%h` %s' $COMMITS
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -306,11 +347,17 @@ jobs:
           | | |
           |---|---|
           | upstream ref | \`${{ needs.resolve.outputs.upstream_ref }}\` (${UPSTREAM_REPO}) |
-          | upstream commit | \`${{ steps.pkg.outputs.commit }}\` |
+          | upstream commit | \`${{ needs.resolve.outputs.commit }}\` |
+          | built commit | \`${{ steps.pkg.outputs.commit }}\` (upstream + Click's patches) |
+          | patches from | \`${PATCH_BRANCH}\` |
           | go | \`${{ steps.pkg.outputs.goversion }}\` |
           | geth_linux sha256 | \`${{ steps.pkg.outputs.sha256 }}\` |
           | max glibc required | \`${{ steps.pkg.outputs.maxglibc }}\` |
           | run | [\`${GITHUB_RUN_ID}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |
+
+          Click's patches:
+
+          ${{ steps.patches.outputs.list }}
 
           \`mainnet.zip\` is upstream's, re-attached unchanged so one variable drives
           both downloads in the role.
