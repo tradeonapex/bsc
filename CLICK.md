@@ -33,7 +33,48 @@ Two reasons `click` is the default and not a side branch:
 **Do not run `gh repo sync`.** It pushes to `master`, which is exactly the thing
 the model above avoids.
 
-## Building
+## The weekly pipeline
+
+The workflow runs itself every **Tuesday at 04:23 UTC** and builds whatever
+bnb-chain's latest *stable* release is, if we have not built it already. Nothing
+is deployed by it: a published release only becomes the binary on a node when
+somebody bumps `bsc_release_tag` + `bsc_geth_sha256` in `ansible-bsc` and runs
+the playbook. The pipeline's job is to make the artifact ready, not to decide
+that it should run.
+
+Why it exists: for two months this workflow was `workflow_dispatch` only, the
+fork sat on `v1.7.8-click1`, upstream shipped `v1.8.1` on 2026-10-16, and the
+role went on downloading bnb-chain's prebuilt `geth_linux` — the exact thing
+this repository was created to stop. A build that needs someone to remember it
+is not a pipeline.
+
+How the decision is made, in the `resolve` job:
+
+| | |
+|---|---|
+| which ref | `repos/bnb-chain/bsc/releases/latest`, which excludes drafts and pre-releases |
+| what it refuses | anything that is not a plain `vX.Y.Z`. `v1.8.0-alpha` must never be built unattended, and `/releases/latest` guarantees the flag, not the name |
+| idempotence | if `<ref>-click1` is already published, a scheduled run is a no-op; a **dispatch** still fails loudly, because an operator who named that release wants to be told |
+| immutability | the tag is resolved to a commit sha before the build starts, and the build asserts the checkout matches it. A tag that moved in between stops the run |
+
+A dispatch overrides all of it: every input you fill in is passed through
+untouched, so the manual path below behaves exactly as it did before.
+
+### The source comes from upstream, not from this fork
+
+The build checks out `bnb-chain/bsc` at the resolved ref — **not** this
+repository. That is what makes an unattended build possible at all: `click`
+holds only the tags that existed when the fork was made, so building `v1.8.1`
+from here would first mean pushing that tag in, and a tag push whose tree
+carries upstream's 12 workflow files is precisely what the branch model above
+exists to avoid.
+
+Nothing is lost by it, because `click` carries no code of ours — it is
+upstream's tree with upstream's workflows removed and ours added. The day we
+actually patch geth, point `repository:` back at this repo and build a
+click-based branch; the release notes record the commit either way.
+
+## Building by hand
 
 Actions → *click · geth_linux → release* → Run workflow.
 
@@ -63,18 +104,36 @@ here rather than as a start-up failure on the node.
 
 ## Bumping to a new upstream version
 
+**Nothing needs to be pushed to this repository.** Dispatch the workflow with
+the new `upstream_ref`, or wait for Tuesday and let the schedule find it. The
+build reads the ref from bnb-chain.
+
+What a bump still needs is the decision, which is deliberately left to a human:
+
+1. read upstream's release notes — a geth bump on a pruned-full node is not
+   always a drop-in, and a hard fork has a date;
+2. set `bsc_release_tag` and `bsc_geth_sha256` in `ansible-bsc` (the release
+   notes print both, ready to paste);
+3. run the playbook. The binary changing fires `notify: restart bsc-geth`, so
+   this is a restart, not a config nudge.
+
+`v1.8.1` (2026-10-16) is the live example of why step 1 is not automatable: it
+is flagged **"Mandatory Update Required: Yes"**, but its audience is *Chapel
+testnet* operators and the Jenner hard fork it carries has **no mainnet
+activation date in that release**. `bsc-01` is a mainnet node. The artifact
+should be built and sitting in a release; running it is a separate call.
+
+Only carrying a patch of our own still needs the merge:
+
 ```sh
 git fetch https://github.com/bnb-chain/bsc.git --tags
 git checkout click
-git merge v1.8.0             # upstream's workflow files stay deleted; resolve
+git merge v1.8.1             # upstream's workflow files stay deleted; resolve
                              # "deleted by us" with `git rm` if it complains
 git push origin click
 ```
 
-Then dispatch the workflow, and update `bsc_release_tag` + `bsc_geth_sha256` in
-`ansible-bsc`. Note that a geth minor bump on a pruned-full node is not always a
-drop-in: check upstream's release notes for a required resync or a hard fork
-date before rolling it out.
+…and then the build must be pointed at this repository instead of upstream.
 
 ## This is a public fork running on self-hosted runners
 
@@ -85,8 +144,10 @@ code on a cluster node.
 
 What keeps that shut:
 
-- the build workflow is **`workflow_dispatch` only**, which requires write
-  access to this repository;
+- the build workflow triggers on **`workflow_dispatch` and `schedule` only**.
+  A dispatch requires write access to this repository and a schedule can only
+  be fired by GitHub itself on the default branch, so neither is reachable by
+  an outside contributor;
 - `fork-pr-contributor-approval` is set to `all_external_contributors`, so no
   workflow runs from any outside PR without a maintainer approving it:
 

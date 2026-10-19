@@ -31,17 +31,144 @@ on:
           - ubuntu-latest
           - lat-fra2-runners
 
+  # Weekly, on the default branch (the only branch a schedule ever runs on).
+  # Tuesday 04:23 UTC: outside the Sunday 01:00-05:00 kured window, and off the
+  # hour so it does not queue behind every other cron in the org.
+  #
+  # GitHub disables a schedule after 60 days without repository activity. The
+  # weekly CodeQL run on this repo keeps it alive; if that ever goes away, this
+  # stops silently and the only symptom is an empty Actions history.
+  schedule:
+    - cron: "23 4 * * 2"
+
 permissions:
   contents: write
 
 concurrency:
-  group: click-bsc-${{ inputs.upstream_ref }}-${{ inputs.suffix }}
+  group: click-bsc-${{ inputs.upstream_ref || 'scheduled' }}-${{ inputs.suffix || 'auto' }}
   cancel-in-progress: false
 
 jobs:
+  # A pipeline needs something that decides, not only something that builds.
+  # This job is that decision, and it is the only place where "what are we
+  # building" is answered: on a dispatch it passes the operator's four inputs
+  # through untouched, and on the weekly schedule it asks bnb-chain what their
+  # latest stable release is and whether we have already built it.
+  #
+  # Why this exists at all: the fork sat on v1.7.8-click1 while upstream shipped
+  # v1.8.1 (2026-10-16) and nobody noticed, because a workflow_dispatch-only
+  # build is a button, not a pipeline. The role kept downloading bnb-chain's
+  # prebuilt binary, which is the thing this repository was created to stop.
+  resolve:
+    name: resolve
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.pick.outputs.build }}
+      upstream_ref: ${{ steps.pick.outputs.upstream_ref }}
+      commit: ${{ steps.pick.outputs.commit }}
+      suffix: ${{ steps.pick.outputs.suffix }}
+      publish: ${{ steps.pick.outputs.publish }}
+      runner: ${{ steps.pick.outputs.runner }}
+      release_tag: ${{ steps.pick.outputs.release_tag }}
+
+    steps:
+      - name: Pick the upstream ref
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: bnb-chain/bsc
+        run: |
+          set -euo pipefail
+
+          REF='${{ inputs.upstream_ref }}'
+          SUFFIX='${{ inputs.suffix }}'
+          PUBLISH='${{ inputs.publish }}'
+          RUNNER='${{ inputs.runner }}'
+
+          SCHEDULED=false
+          [ '${{ github.event_name }}' = 'schedule' ] && SCHEDULED=true
+
+          # A schedule carries no inputs at all. Every one of the four is the
+          # empty string -- NOT the dispatch default, which only the form fills
+          # in. Default them here so the build job never has to care which
+          # event started it.
+          if [ -z "$REF" ]; then
+            REF=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+            echo "upstream latest stable release: ${REF}"
+          fi
+          [ -n "$SUFFIX" ]  || SUFFIX=click1
+          [ -n "$PUBLISH" ] || PUBLISH=true
+          [ -n "$RUNNER" ]  || RUNNER=ubuntu-22.04
+
+          # /releases/latest already excludes drafts and pre-releases, but it
+          # promises nothing about the NAME: v1.8.0-alpha was published upstream
+          # as a pre-release, and the day a release like it is not flagged as
+          # one, an unattended build must not quietly produce a binary from it.
+          # Only a plain vX.Y.Z builds on a schedule; anything else needs a
+          # human to dispatch it by name.
+          if [ "$SCHEDULED" = true ] && ! printf '%s' "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::warning::${REF} is not a plain vX.Y.Z tag, so this scheduled run will not build it. Dispatch it by hand if that is what you want."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RELEASE_TAG="${REF}-${SUFFIX}"
+
+          # Resolve the tag to a commit NOW and make the build assert it later.
+          # A tag is a moving reference: upstream can repoint it, and without
+          # this the thing we inspected here and the thing we compile there are
+          # only probably the same object. ^{} dereferences an annotated tag to
+          # its commit; the bare ref is the fallback for a lightweight one.
+          BASE="https://github.com/${UPSTREAM_REPO}.git"
+          COMMIT=$(git ls-remote "$BASE" "refs/tags/${REF}^{}" | cut -f1)
+          [ -n "$COMMIT" ] || COMMIT=$(git ls-remote "$BASE" "refs/tags/${REF}" | cut -f1)
+          if [ -z "$COMMIT" ]; then
+            echo "::error::${REF} is not a tag in ${UPSTREAM_REPO}."
+            exit 1
+          fi
+
+          # Idempotence. A weekly run that finds its release already published
+          # is a no-op, not a failure -- on a dispatch the build job's own
+          # refusal still errors loudly, because an operator who asked for this
+          # release by name wants to be told, not silently skipped.
+          BUILD=true
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$SCHEDULED" = true ]; then
+              echo "${RELEASE_TAG} is already published; nothing to do."
+              BUILD=false
+            fi
+          fi
+
+          {
+            echo "build=${BUILD}"
+            echo "upstream_ref=${REF}"
+            echo "commit=${COMMIT}"
+            echo "suffix=${SUFFIX}"
+            echo "publish=${PUBLISH}"
+            echo "runner=${RUNNER}"
+            echo "release_tag=${RELEASE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### resolve"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| event | \`${{ github.event_name }}\` |"
+            echo "| upstream ref | \`${REF}\` |"
+            echo "| commit | \`${COMMIT}\` |"
+            echo "| release tag | \`${RELEASE_TAG}\` |"
+            echo "| will build | \`${BUILD}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
-    name: geth_linux @ ${{ inputs.upstream_ref }}
-    runs-on: ${{ inputs.runner }}
+    name: geth_linux @ ${{ needs.resolve.outputs.upstream_ref }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ${{ needs.resolve.outputs.runner }}
     timeout-minutes: 60
 
     env:
@@ -49,11 +176,11 @@ jobs:
       # genesis.json as mainnet.zip on its own releases; we re-attach it to ours
       # so bsc_release_tag alone decides both downloads in the role.
       UPSTREAM_REPO: bnb-chain/bsc
-      RELEASE_TAG: ${{ inputs.upstream_ref }}-${{ inputs.suffix }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
 
     steps:
       - name: Refuse to overwrite an existing release
-        if: inputs.publish
+        if: needs.resolve.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -63,12 +190,41 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout ${{ inputs.upstream_ref }}
+      # Checked out from bnb-chain, not from this fork, and that is the change
+      # that turns the button into a pipeline. `click` is upstream's tree with
+      # upstream's workflows removed and ours added -- it carries no code of
+      # ours -- but it only holds the tags that existed when the fork was made.
+      # Building v1.8.1 from here would first require pushing that tag into this
+      # repository, and a tag push whose tree carries upstream's 12 workflow
+      # files is exactly what CLICK.md's branch model exists to avoid. Reading
+      # the ref from upstream at build time needs no push at all.
+      #
+      # fetch-tags matters: `make geth` stamps the binary from the tag that
+      # points at HEAD, so a bare-commit checkout would produce a geth that
+      # reports no version.
+      - name: Checkout ${{ needs.resolve.outputs.upstream_ref }} from bnb-chain/bsc
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.upstream_ref }}
+          repository: bnb-chain/bsc
+          ref: ${{ needs.resolve.outputs.upstream_ref }}
           fetch-depth: 1
           fetch-tags: true
+
+      # The resolve job turned that tag into a sha before this job started.
+      # Tags move; if this one moved in between, stop rather than publish a
+      # binary built from code nobody looked at.
+      - name: Assert the checkout matches the resolved commit
+        env:
+          EXPECTED: ${{ needs.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          ACTUAL=$(git rev-parse HEAD)
+          echo "resolved by the resolve job: ${EXPECTED}"
+          echo "checked out here:            ${ACTUAL}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::${{ needs.resolve.outputs.upstream_ref }} moved between resolve and build. Refusing to build it."
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -125,7 +281,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release download "${{ inputs.upstream_ref }}" \
+          gh release download "${{ needs.resolve.outputs.upstream_ref }}" \
             --repo "$UPSTREAM_REPO" \
             --pattern mainnet.zip \
             --dir dist
@@ -134,12 +290,12 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: geth_linux-${{ inputs.upstream_ref }}
+          name: geth_linux-${{ needs.resolve.outputs.upstream_ref }}
           path: dist/
           retention-days: 7
 
       - name: Publish the release
-        if: inputs.publish
+        if: needs.resolve.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -149,7 +305,7 @@ jobs:
 
           | | |
           |---|---|
-          | upstream ref | \`${{ inputs.upstream_ref }}\` (${UPSTREAM_REPO}) |
+          | upstream ref | \`${{ needs.resolve.outputs.upstream_ref }}\` (${UPSTREAM_REPO}) |
           | upstream commit | \`${{ steps.pkg.outputs.commit }}\` |
           | go | \`${{ steps.pkg.outputs.goversion }}\` |
           | geth_linux sha256 | \`${{ steps.pkg.outputs.sha256 }}\` |
@@ -161,7 +317,7 @@ jobs:
 
           \`\`\`yaml
           # rke2/<cluster>/inventory/host_vars/bsc-01 (or ansible-bsc defaults)
-          bsc_version: ${{ inputs.upstream_ref }}
+          bsc_version: ${{ needs.resolve.outputs.upstream_ref }}
           bsc_release_tag: ${RELEASE_TAG}
           bsc_geth_sha256: "${{ steps.pkg.outputs.sha256 }}"
           \`\`\`
@@ -185,11 +341,11 @@ jobs:
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| upstream ref | \`${{ inputs.upstream_ref }}\` |"
+            echo "| upstream ref | \`${{ needs.resolve.outputs.upstream_ref }}\` |"
             echo "| commit | \`${{ steps.pkg.outputs.commit }}\` |"
             echo "| sha256 | \`${{ steps.pkg.outputs.sha256 }}\` |"
             echo "| max glibc | \`${{ steps.pkg.outputs.maxglibc }}\` |"
-            echo "| published | \`${{ inputs.publish }}\` |"
+            echo "| published | \`${{ needs.resolve.outputs.publish }}\` |"
             echo
             echo "Set in \`ansible-bsc/defaults/main.yml\`:"
             echo
